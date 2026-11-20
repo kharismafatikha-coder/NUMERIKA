@@ -8,8 +8,10 @@ import hmac
 import os
 import csv
 import io
+import random
 import plotly.graph_objects as go
 from datetime import datetime
+from konten import LEVELS, QUIZ_BANK, PASS_PERCENT
 
 # =========================================================
 # NUMERIKA | Interactive Numerical Methods Learning Platform
@@ -53,9 +55,14 @@ def init_db():
                 username TEXT NOT NULL,
                 score INTEGER NOT NULL,
                 total INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'Dasar'
             )
         """)
+        # Migrasi untuk database lama (kuis 5 soal) yang belum punya kolom level
+        kolom = [r[1] for r in con.execute("PRAGMA table_info(quiz_history)")]
+        if "level" not in kolom:
+            con.execute("ALTER TABLE quiz_history ADD COLUMN level TEXT NOT NULL DEFAULT 'Dasar'")
         con.execute("""
             CREATE TABLE IF NOT EXISTS activity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,25 +115,35 @@ def log_activity(username, activity_name):
         )
 
 def get_user_stats(username):
+    """Mengembalikan: jumlah kuis, skor terbaik (%), jumlah aktivitas, 5 riwayat kuis terakhir."""
     with db() as con:
-        quiz_count, best_score = con.execute(
-            "SELECT COUNT(*), COALESCE(MAX(score), 0) FROM quiz_history WHERE username = ?",
+        quiz_count, best_pct = con.execute(
+            "SELECT COUNT(*), COALESCE(MAX(score * 100.0 / total), 0) FROM quiz_history WHERE username = ?",
             (username,)
         ).fetchone()
         activity_count = con.execute(
             "SELECT COUNT(*) FROM activity WHERE username = ?", (username,)
         ).fetchone()[0]
         latest = con.execute(
-            "SELECT score, total, created_at FROM quiz_history WHERE username = ? ORDER BY id DESC LIMIT 5",
+            "SELECT score, total, created_at, level FROM quiz_history WHERE username = ? ORDER BY id DESC LIMIT 5",
             (username,)
         ).fetchall()
-    return quiz_count, best_score, activity_count, latest
+    return quiz_count, int(round(best_pct)), activity_count, latest
 
-def save_quiz(username, score, total):
+def get_level_stats(username):
+    """Mengembalikan {level: (jumlah percobaan, skor terbaik dalam %)}."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT level, COUNT(*), MAX(score * 100.0 / total) FROM quiz_history WHERE username = ? GROUP BY level",
+            (username,)
+        ).fetchall()
+    return {lv: (n, int(round(best))) for lv, n, best in rows}
+
+def save_quiz(username, score, total, level="Dasar"):
     with db() as con:
         con.execute(
-            "INSERT INTO quiz_history(username, score, total, created_at) VALUES (?, ?, ?, ?)",
-            (username, score, total, datetime.now().isoformat(timespec="seconds"))
+            "INSERT INTO quiz_history(username, score, total, created_at, level) VALUES (?, ?, ?, ?, ?)",
+            (username, score, total, datetime.now().isoformat(timespec="seconds"), level)
         )
 
 init_db()
@@ -139,6 +156,9 @@ defaults = {
     "theme": "Terang",
     "quiz_submitted": False,
     "quiz_answers": {},
+    "quiz_level": None,
+    "quiz_set": [],
+    "quiz_attempt": 0,
     "calc_result": None,
 }
 for key, value in defaults.items():
@@ -366,6 +386,9 @@ with st.sidebar:
         st.session_state.logged_in = False
         st.session_state.user = None
         st.session_state.page = "Dashboard"
+        st.session_state.quiz_level = None
+        st.session_state.quiz_set = []
+        st.session_state.quiz_submitted = False
         st.rerun()
 
 # ------------------------- COMMON HELPERS -------------------------
@@ -387,14 +410,14 @@ def log_once(tag):
 
 # ------------------------- DASHBOARD -------------------------
 page = st.session_state.page
-quiz_count, best_score, activity_count, latest_quizzes = get_user_stats(username)
+quiz_count, best_pct, activity_count, latest_quizzes = get_user_stats(username)
 
 if page == "Dashboard":
     hero(f"Halo, {user['name'].split()[0]}! 👋", "Selamat datang kembali. Siap memahami Metode Numerik dengan cara yang lebih interaktif?", "Belajar • Bereksperimen • Memahami")
     a, b, c, d = st.columns(4)
     kpi(a, "📘", "Materi tersedia", "06", "Topik pembelajaran")
     kpi(b, "🧠", "Kuis dikerjakan", quiz_count, "Evaluasi tersimpan")
-    kpi(c, "🏆", "Skor terbaik", f"{best_score}/5" if quiz_count else "—", "Dari kuis konsep")
+    kpi(c, "🏆", "Skor terbaik", f"{best_pct}%" if quiz_count else "—", "Dari semua level kuis")
     kpi(d, "✨", "Aktivitas belajar", activity_count, "Aktivitas tercatat")
     section("Jelajahi ruang belajar")
     cards = st.columns(2)
@@ -402,7 +425,7 @@ if page == "Dashboard":
         ("📚", "Materi pembelajaran", "Pelajari konsep, rumus, algoritma, dan contoh perhitungan.", "Materi"),
         ("🧮", "Laboratorium kalkulator", "Gunakan Newton-Raphson dan amati proses iterasinya.", "Kalkulator"),
         ("📈", "Visualisasi iterasi", "Lihat garis singgung menuntun tebakan menuju akar.", "Visualisasi"),
-        ("🎯", "Kuis interaktif", "Uji pemahamanmu dan dapatkan skor secara langsung.", "Kuis"),
+        ("🎯", "Kuis interaktif", "Tiga level soal (dasar, menengah, mahir) dengan skor dan pembahasan langsung.", "Kuis"),
     ]
     for i, (ic, name, desc, target) in enumerate(items):
         with cards[i % 2]:
@@ -413,62 +436,11 @@ if page == "Dashboard":
             st.write("")
     section("Riwayat kuis terakhir")
     if latest_quizzes:
-        for score, total, date in latest_quizzes:
-            st.markdown(f'<div class="card" style="margin-bottom:8px">🎓 Skor <b>{score}/{total}</b> <span style="color:{MUTED}">· {date[:16].replace("T"," ")}</span></div>', unsafe_allow_html=True)
+        for score, total, date, level in latest_quizzes:
+            icon = LEVELS.get(level, {}).get("icon", "🎓")
+            st.markdown(f'<div class="card" style="margin-bottom:8px">{icon} <b>{level}</b> · Skor <b>{score}/{total}</b> <span style="color:{MUTED}">· {date[:16].replace("T"," ")}</span></div>', unsafe_allow_html=True)
     else:
         st.info("Belum ada riwayat kuis. Coba kerjakan kuis pertamamu!")
-
-# ------------------------- MATERI -------------------------
-if page == "Materi":
-    hero("Ruang Materi", "Pelajari dasar-dasar metode numerik secara bertahap.")
-    topics = {
-        "Pengantar Metode Numerik": """
-Metode numerik adalah teknik untuk memperoleh solusi hampiran dari persoalan matematika melalui prosedur komputasi. Metode ini digunakan ketika solusi analitik sulit diperoleh atau ketika solusi numerik lebih praktis.
-
-**Konsep penting:** galat, toleransi, iterasi, konvergensi, dan stabilitas.
-""",
-        "Persamaan Nonlinear": """
-Persamaan nonlinear dapat ditulis dalam bentuk **f(x) = 0**. Tujuan metode pencarian akar adalah menemukan nilai x yang membuat nilai fungsi mendekati nol.
-
-Contoh: f(x) = x² − 2. Akar positifnya adalah √2, yang dapat dihampiri secara numerik.
-""",
-        "Metode Bisection": """
-Metode Bisection membagi interval [a,b] menjadi dua bagian. Jika f(a)f(b) < 0 dan fungsi kontinu, terdapat setidaknya satu akar pada interval tersebut.
-
-Titik tengah dihitung dengan **c = (a+b)/2**. Interval kemudian dipersempit berdasarkan perubahan tanda fungsi.
-""",
-        "Metode Regula Falsi": """
-Regula Falsi memperkirakan akar menggunakan garis yang menghubungkan titik (a,f(a)) dan (b,f(b)).
-
-Rumus titik pendekatannya:
-
-**c = (a f(b) − b f(a)) / (f(b) − f(a))**
-
-Salah satu ujung interval diganti agar perubahan tanda tetap terjaga.
-""",
-        "Metode Newton-Raphson": """
-Newton-Raphson menggunakan garis singgung kurva untuk memperkirakan akar persamaan.
-
-**xₙ₊₁ = xₙ − f(xₙ)/f′(xₙ)**
-
-Proses dimulai dari tebakan awal x₀. Setiap iterasi menghasilkan pendekatan baru. Metode membutuhkan turunan dan dapat gagal jika f′(xₙ) = 0 atau tebakan awal kurang sesuai.
-""",
-        "Metode Secant": """
-Metode Secant menggunakan dua pendekatan sebelumnya untuk memperkirakan kemiringan fungsi, sehingga tidak memerlukan turunan analitik.
-
-**xₙ₊₁ = xₙ − f(xₙ)(xₙ−xₙ₋₁)/(f(xₙ)−f(xₙ₋₁))**
-
-Diperlukan dua tebakan awal dan penyebut tidak boleh nol.
-"""
-    }
-    topic = st.selectbox("Pilih topik", list(topics.keys()))
-    topic_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", topics[topic]).replace(chr(10), "<br>")
-    st.markdown(f'<div class="card"><h3>📖 {topic}</h3><p>{topic_html}</p></div>', unsafe_allow_html=True)
-    if topic == "Metode Newton-Raphson":
-        section("Alur algoritma")
-        st.code("1. Tentukan f(x), f'(x), x0, toleransi, dan iterasi maksimum\n2. Hitung f(xn) dan f'(xn)\n3. Hitung xn+1 = xn - f(xn)/f'(xn)\n4. Hitung galat relatif\n5. Ulangi sampai galat < toleransi atau iterasi maksimum tercapai", language="text")
-    st.caption("Materi ini merupakan ringkasan pengantar. Pengembangan topik dan latihan dapat ditambahkan pada versi berikutnya.")
-    log_once("Membuka materi")
 
 # ------------------------- CALCULATOR HELPERS -------------------------
 FN = ["sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "log", "sqrt"]
@@ -561,6 +533,282 @@ def plot_newton(f, rows, dark):
     )
     return fig
 
+# ------------------------- MATERI NEWTON-RAPHSON (LENGKAP) -------------------------
+def _plain_table(head, body_rows):
+    th = "".join(f"<th>{h}</th>" for h in head)
+    tr = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in body_rows)
+    return f'<div class="tbl-wrap"><table class="tbl"><thead><tr>{th}</tr></thead><tbody>{tr}</tbody></table></div>'
+
+def render_newton_materi():
+    f_demo = lambda x: x ** 2 - 2
+    df_demo = lambda x: 2 * x
+    tabs = st.tabs(["1 · Konsep", "2 · Penurunan rumus", "3 · Algoritma", "4 · Contoh hitung",
+                    "5 · Konvergensi & galat", "6 · Kelebihan & kekurangan", "7 · Kasus gagal", "8 · Latihan"])
+
+    # ---- 1. Konsep ----
+    with tabs[0]:
+        st.markdown("""
+#### Masalah yang diselesaikan
+Banyak persamaan tidak dapat diselesaikan secara aljabar, misalnya $x^3 - 2x - 5 = 0$ atau $\\cos x = x$.
+Dalam bentuk umum kita mencari **akar** $r$ yang memenuhi $f(r) = 0$.
+
+#### Ide Newton-Raphson
+1. Tebak sebuah titik awal $x_0$ yang dekat dengan akar.
+2. Di titik $(x_0, f(x_0))$ gambar **garis singgung** kurva. Garis singgung ini adalah hampiran linear dari kurva.
+3. Titik potong garis singgung dengan **sumbu-x** dijadikan tebakan baru $x_1$.
+4. Ulangi dari $x_1$, dan seterusnya, sampai tebakan baru nyaris tidak berubah.
+
+Karena kurva yang mulus di dekat akar mirip dengan garis lurus, tebakan baru biasanya jauh lebih dekat ke akar daripada tebakan lama.
+""")
+        rows_demo, _, _ = newton_raphson(f_demo, df_demo, 3.0, 1e-12, 4)
+        st.plotly_chart(plot_newton(f_demo, rows_demo[:3], DARK), use_container_width=True)
+        st.caption("Ilustrasi untuk f(x) = x² − 2 dengan x₀ = 3. Setiap garis singgung (putus-putus biru) memotong sumbu-x di tebakan berikutnya, "
+                   "yang bergerak cepat menuju akar √2 ≈ 1.41421.")
+
+    # ---- 2. Penurunan rumus ----
+    with tabs[1]:
+        st.markdown("Ada dua cara yang setara untuk memperoleh rumus Newton-Raphson.")
+        st.markdown("**Cara 1 · Dari garis singgung.** Persamaan garis singgung di $(x_n, f(x_n))$ adalah")
+        st.latex(r"y = f(x_n) + f'(x_n)\,(x - x_n)")
+        st.markdown("Titik potong dengan sumbu-x diperoleh dengan mengambil $y = 0$:")
+        st.latex(r"0 = f(x_n) + f'(x_n)\,(x - x_n) \;\Longrightarrow\; x = x_n - \frac{f(x_n)}{f'(x_n)}")
+        st.markdown("**Cara 2 · Dari deret Taylor.** Untuk $x$ dekat $x_n$,")
+        st.latex(r"f(x) \approx f(x_n) + f'(x_n)(x - x_n) + \tfrac{1}{2}f''(\xi)(x - x_n)^2")
+        st.markdown("Suku orde dua diabaikan lalu $f(x) = 0$ diselesaikan, sehingga diperoleh rumus yang sama:")
+        st.latex(r"\boxed{\,x_{n+1} = x_n - \frac{f(x_n)}{f'(x_n)}\,}")
+        st.markdown("""
+**Turunan numerik.** Bila turunan analitik sulit dicari, $f'(x)$ dapat dihampiri dengan beda pusat:
+""")
+        st.latex(r"f'(x) \approx \frac{f(x+h) - f(x-h)}{2h}, \qquad h \approx 10^{-6}")
+        st.caption("Inilah yang dipakai menu Kalkulator ketika kolom turunan dikosongkan.")
+
+    # ---- 3. Algoritma ----
+    with tabs[2]:
+        st.markdown("#### Langkah-langkah")
+        st.code("1. Tentukan f(x), f'(x), tebakan awal x0, toleransi, dan iterasi maksimum\n"
+                "2. Hitung f(xn) dan f'(xn)\n"
+                "3. Jika f'(xn) ≈ 0, hentikan: tebakan awal harus diganti\n"
+                "4. Hitung xn+1 = xn - f(xn)/f'(xn)\n"
+                "5. Hitung galat relatif = |xn+1 - xn| / |xn+1|\n"
+                "6. Jika galat < toleransi, hentikan dan xn+1 adalah akar hampiran\n"
+                "7. Jika belum dan n < iterasi maksimum, set n = n + 1 lalu ulangi dari langkah 2", language="text")
+        st.markdown("#### Implementasi Python")
+        st.code("""def newton_raphson(f, df, x0, tol=1e-8, max_iter=50):
+    x = x0
+    for n in range(1, max_iter + 1):
+        d = df(x)
+        if abs(d) < 1e-15:
+            raise ZeroDivisionError("f'(x) mendekati nol, ganti tebakan awal")
+        x_baru = x - f(x) / d
+        galat = abs((x_baru - x) / x_baru) if x_baru != 0 else abs(x_baru - x)
+        if galat < tol:
+            return x_baru, n
+        x = x_baru
+    raise RuntimeError("Belum konvergen sampai iterasi maksimum")
+
+akar, iterasi = newton_raphson(lambda x: x**2 - 2, lambda x: 2*x, x0=1.5)
+print(akar, iterasi)   # 1.41421356..., 4""", language="python")
+        st.markdown("""
+#### Kriteria penghentian yang umum dipakai
+- **Galat relatif**: $\\left|\\dfrac{x_{n+1}-x_n}{x_{n+1}}\\right| < \\varepsilon$ (dipakai pada kalkulator NUMERIKA).
+- **Galat absolut**: $|x_{n+1}-x_n| < \\varepsilon$.
+- **Residual fungsi**: $|f(x_{n+1})| < \\varepsilon$.
+- **Iterasi maksimum**: pengaman agar program tidak berputar selamanya.
+""")
+
+    # ---- 4. Contoh hitung ----
+    with tabs[3]:
+        st.markdown("#### Contoh 1 · Menghampiri √2")
+        st.markdown("Selesaikan $f(x) = x^2 - 2 = 0$ dengan $f'(x) = 2x$ dan $x_0 = 1$.")
+        st.latex(r"x_1 = 1 - \frac{f(1)}{f'(1)} = 1 - \frac{-1}{2} = 1.5")
+        st.latex(r"x_2 = 1.5 - \frac{f(1.5)}{f'(1.5)} = 1.5 - \frac{0.25}{3} \approx 1.416667")
+        st.latex(r"x_3 = 1.416667 - \frac{f(1.416667)}{f'(1.416667)} \approx 1.414216")
+        rows1, ok1, _ = newton_raphson(f_demo, df_demo, 1.0, 1e-10, 20)
+        st.markdown(iteration_table(rows1, ok1), unsafe_allow_html=True)
+        st.caption("Tabel dihitung langsung oleh program. Hanya 4 iterasi sudah cukup untuk ketelitian 10⁻¹⁰.")
+
+        st.markdown("#### Contoh 2 · Persamaan $x^3 - 2x - 5 = 0$")
+        st.markdown("Dengan $f'(x) = 3x^2 - 2$ dan $x_0 = 2$:")
+        st.latex(r"f(2) = -1,\quad f'(2) = 10 \;\Rightarrow\; x_1 = 2 - \frac{-1}{10} = 2.1")
+        st.latex(r"f(2.1) = 0.061,\quad f'(2.1) = 11.23 \;\Rightarrow\; x_2 = 2.1 - \frac{0.061}{11.23} \approx 2.094568")
+        f2 = lambda x: x ** 3 - 2 * x - 5
+        df2 = lambda x: 3 * x ** 2 - 2
+        rows2, ok2, _ = newton_raphson(f2, df2, 2.0, 1e-10, 20)
+        st.markdown(iteration_table(rows2, ok2), unsafe_allow_html=True)
+        st.caption("Akar hampiran x ≈ 2.0945515. Coba contoh ini di menu Kalkulator untuk melihat garis singgungnya.")
+
+        st.markdown("#### Contoh 3 · Rumus akar kuadrat (metode Babilonia)")
+        st.markdown("Untuk $f(x) = x^2 - a$, rumus Newton-Raphson menyederhana menjadi")
+        st.latex(r"x_{n+1} = \frac{1}{2}\left(x_n + \frac{a}{x_n}\right)")
+        st.caption("Inilah cara kalkulator dan komputer menghitung akar kuadrat sejak zaman Babilonia.")
+
+    # ---- 5. Konvergensi & galat ----
+    with tabs[4]:
+        st.markdown("""
+#### Konvergensi kuadratik
+Bila $r$ adalah akar sederhana ($f'(r) \\neq 0$) dan tebakan awal cukup dekat, galat $e_n = x_n - r$ memenuhi
+""")
+        st.latex(r"e_{n+1} \approx C\,e_n^2, \qquad C = \frac{f''(r)}{2f'(r)}")
+        st.markdown("Artinya galat **dikuadratkan** pada tiap iterasi, sehingga jumlah digit benar kira-kira **berlipat dua**. "
+                    "Berikut buktinya untuk $f(x)=x^2-2$ dengan $x_0 = 1$ (nilai sebenarnya $\\sqrt{2}$):")
+        r_true = math.sqrt(2)
+        xs = [1.0]
+        for _ in range(4):
+            xs.append(xs[-1] - f_demo(xs[-1]) / df_demo(xs[-1]))
+        errs = [abs(v - r_true) for v in xs]
+        body = []
+        for i, v in enumerate(xs):
+            ratio = f"{errs[i] / errs[i-1] ** 2:.4f}" if i > 0 else "—"
+            body.append([i, f"{v:.12f}", f"{errs[i]:.3e}", ratio])
+        st.markdown(_plain_table(["n", "xₙ", "|xₙ − √2|", "eₙ / eₙ₋₁²"], body), unsafe_allow_html=True)
+        st.caption(f"Rasio eₙ / eₙ₋₁² mendekati konstanta C = f″/(2f′) = 1/(2√2) ≈ {1/(2*r_true):.4f}, sesuai teori.")
+        st.markdown("""
+#### Syarat konvergensi lokal
+- $f'(r) \\neq 0$ (akar sederhana, bukan akar ganda).
+- $f''$ kontinu di sekitar $r$.
+- Tebakan awal $x_0$ cukup dekat dengan $r$.
+
+#### Akar ganda
+Jika $f'(r) = 0$, konvergensi turun menjadi **linear**. Bila multiplisitas $m$ diketahui, gunakan modifikasi
+$x_{n+1} = x_n - m\\,\\dfrac{f(x_n)}{f'(x_n)}$ untuk memulihkan kecepatan kuadratik.
+""")
+
+    # ---- 6. Kelebihan & kekurangan ----
+    with tabs[5]:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("""
+#### ✅ Kelebihan
+- Sangat **cepat** (konvergensi kuadratik) di dekat akar.
+- Hanya butuh **satu tebakan awal**, tanpa interval.
+- Rumusnya sederhana dan mudah diprogram.
+- Dapat diperluas ke **sistem persamaan** (matriks Jacobian) dan optimasi.
+""")
+        with c2:
+            st.markdown("""
+#### ⚠️ Kekurangan
+- Memerlukan **turunan** $f'(x)$ di setiap iterasi.
+- **Tidak dijamin konvergen**; sangat bergantung pada $x_0$.
+- Gagal bila $f'(x_n) = 0$ atau mendekati nol.
+- Lambat (linear) pada **akar ganda**.
+""")
+        st.markdown("#### Perbandingan dengan metode pencarian akar lain")
+        st.markdown(_plain_table(
+            ["Metode", "Orde konvergensi", "Butuh turunan", "Masukan awal", "Dijamin konvergen"],
+            [["Bisection", "1 (linear)", "Tidak", "Interval [a, b] berubah tanda", "Ya"],
+             ["Regula Falsi", "≈ 1 (linear)", "Tidak", "Interval [a, b] berubah tanda", "Ya"],
+             ["Secant", "≈ 1.618", "Tidak", "Dua tebakan awal", "Tidak"],
+             ["Newton-Raphson", "2 (kuadratik)", "Ya", "Satu tebakan awal", "Tidak"]]), unsafe_allow_html=True)
+
+    # ---- 7. Kasus gagal ----
+    with tabs[6]:
+        st.markdown("Newton-Raphson cepat, tetapi tidak selalu berhasil. Berikut kasus yang perlu diwaspadai.")
+        with st.expander("1 · Turunan bernilai nol"):
+            st.markdown("Untuk $f(x) = x^2 - 2$ dengan $x_0 = 0$ diperoleh $f'(0) = 0$, sehingga $x_1$ tidak terdefinisi (pembagian dengan nol). "
+                        "Garis singgungnya mendatar dan tidak pernah memotong sumbu-x.")
+        with st.expander("2 · Iterasi berputar (siklus)"):
+            st.markdown("Untuk $f(x) = x^3 - 2x + 2$ dengan $x_0 = 0$:")
+            st.latex(r"x_1 = 0 - \frac{2}{-2} = 1, \qquad x_2 = 1 - \frac{1}{1} = 0, \qquad x_3 = 1, \;\dots")
+            st.markdown("Iterasi terjebak pada siklus $0 \\to 1 \\to 0 \\to \\cdots$ dan tidak pernah menuju akar. "
+                        "Coba di menu **Kalkulator**: pilih contoh *x³ − 2x + 2 (kasus siklus)* lalu lihat statusnya.")
+        with st.expander("3 · Iterasi menjauhi akar (divergen)"):
+            st.markdown("Untuk $f(x) = \\sqrt[3]{x}$ dengan $x_0 = 1$, karena $f/f' = 3x$, rumus menjadi $x_{n+1} = -2x_n$:")
+            st.latex(r"1,\; -2,\; 4,\; -8,\; 16,\; \dots")
+            st.markdown("Tebakan justru semakin jauh dari akar $x = 0$.")
+        with st.expander("4 · Akar ganda"):
+            st.markdown("Untuk $f(x) = (x-1)^2$ diperoleh $x_{n+1} - 1 = \\tfrac12 (x_n - 1)$. Galat hanya **setengahnya** tiap iterasi "
+                        "(konvergensi linear), jauh lebih lambat dari biasanya.")
+        with st.expander("5 · Tebakan awal terlalu jauh"):
+            st.markdown("Bila $x_0$ jauh dari akar atau berada di dekat titik yang kemiringannya sangat landai, garis singgung dapat melempar "
+                        "tebakan berikutnya ke sekitar **akar yang lain** atau ke daerah yang jauh.")
+        st.markdown("""
+#### Tips praktis
+- **Gambar grafik** $f(x)$ terlebih dahulu untuk memilih $x_0$ yang masuk akal.
+- Coba beberapa tebakan awal dan bandingkan hasilnya.
+- Periksa $|f(x_{\\text{akhir}})|$, bukan hanya galat antar-iterasi.
+- Gunakan **metode hibrida**: Bisection sebagai pengaman, Newton-Raphson untuk mempercepat.
+""")
+
+    # ---- 8. Latihan ----
+    with tabs[7]:
+        st.markdown("Kerjakan sendiri dulu, lalu buka pembahasannya. Gunakan menu **Kalkulator** untuk memeriksa jawabanmu.")
+        with st.expander("Soal 1 · Hitung dua iterasi pertama untuk menghampiri √5"):
+            st.markdown("Gunakan $f(x) = x^2 - 5$ dan $x_0 = 2$.")
+            if st.toggle("Tampilkan pembahasan", key="latihan_1"):
+                st.latex(r"x_1 = 2 - \frac{-1}{4} = 2.25, \qquad x_2 = 2.25 - \frac{0.0625}{4.5} \approx 2.236111")
+                st.caption("Nilai sebenarnya √5 ≈ 2.236068.")
+        with st.expander("Soal 2 · Dua iterasi untuk x³ − x − 1 = 0"):
+            st.markdown("Gunakan $x_0 = 1$.")
+            if st.toggle("Tampilkan pembahasan", key="latihan_2"):
+                st.latex(r"f'(x) = 3x^2 - 1,\quad x_1 = 1 - \frac{-1}{2} = 1.5,\quad x_2 = 1.5 - \frac{0.875}{5.75} \approx 1.347826")
+                st.caption("Akar sebenarnya ≈ 1.324718, sehingga iterasi berikutnya semakin mendekatinya.")
+        with st.expander("Soal 3 · Turunkan rumus iterasi untuk menghampiri ∛10"):
+            st.markdown("Gunakan $f(x) = x^3 - 10$.")
+            if st.toggle("Tampilkan pembahasan", key="latihan_3"):
+                st.latex(r"x_{n+1} = x_n - \frac{x_n^3 - 10}{3x_n^2} = \frac{2x_n + 10/x_n^2}{3}")
+                st.caption("Dengan x₀ = 2 diperoleh x₁ ≈ 2.166667, x₂ ≈ 2.154504, dan ∛10 ≈ 2.154435.")
+        with st.expander("Soal 4 · Mengapa x₀ = 0 gagal untuk f(x) = x² − 2?"):
+            if st.toggle("Tampilkan pembahasan", key="latihan_4"):
+                st.markdown("Karena $f'(x) = 2x$ sehingga $f'(0) = 0$. Rumus iterasi membagi dengan $f'(x_0)$, yaitu pembagian dengan nol. "
+                            "Secara geometris, garis singgung di $x = 0$ mendatar dan tidak memotong sumbu-x.")
+        with st.expander("Soal 5 · Eksperimen: cos(x) = x"):
+            st.markdown("Tulis sebagai $f(x) = \\cos x - x$ dengan $f'(x) = -\\sin x - 1$. Jalankan di **Kalkulator** dengan $x_0 = 0.5$ dan toleransi $10^{-8}$. Berapa iterasi yang diperlukan?")
+            if st.toggle("Tampilkan pembahasan", key="latihan_5"):
+                st.markdown("Akar hampiran $x \\approx 0.7390851332$. Iterasi mencapai galat relatif di bawah $10^{-8}$ dalam sekitar **4 iterasi**.")
+
+# ------------------------- MATERI -------------------------
+if page == "Materi":
+    hero("Ruang Materi", "Pelajari dasar-dasar metode numerik secara bertahap.")
+    topics = {
+        "Pengantar Metode Numerik": """
+Metode numerik adalah teknik untuk memperoleh solusi hampiran dari persoalan matematika melalui prosedur komputasi. Metode ini digunakan ketika solusi analitik sulit diperoleh atau ketika solusi numerik lebih praktis.
+
+**Konsep penting:** galat, toleransi, iterasi, konvergensi, dan stabilitas.
+""",
+        "Persamaan Nonlinear": """
+Persamaan nonlinear dapat ditulis dalam bentuk **f(x) = 0**. Tujuan metode pencarian akar adalah menemukan nilai x yang membuat nilai fungsi mendekati nol.
+
+Contoh: f(x) = x² − 2. Akar positifnya adalah √2, yang dapat dihampiri secara numerik.
+""",
+        "Metode Bisection": """
+Metode Bisection membagi interval [a,b] menjadi dua bagian. Jika f(a)f(b) < 0 dan fungsi kontinu, terdapat setidaknya satu akar pada interval tersebut.
+
+Titik tengah dihitung dengan **c = (a+b)/2**. Interval kemudian dipersempit berdasarkan perubahan tanda fungsi.
+""",
+        "Metode Regula Falsi": """
+Regula Falsi memperkirakan akar menggunakan garis yang menghubungkan titik (a,f(a)) dan (b,f(b)).
+
+Rumus titik pendekatannya:
+
+**c = (a f(b) − b f(a)) / (f(b) − f(a))**
+
+Salah satu ujung interval diganti agar perubahan tanda tetap terjaga.
+""",
+        "Metode Newton-Raphson (Lengkap)": """
+Newton-Raphson menggunakan garis singgung kurva untuk memperkirakan akar persamaan.
+
+**xₙ₊₁ = xₙ − f(xₙ)/f′(xₙ)**
+
+Proses dimulai dari tebakan awal x₀. Setiap iterasi menghasilkan pendekatan baru. Metode membutuhkan turunan dan dapat gagal jika f′(xₙ) = 0 atau tebakan awal kurang sesuai.
+""",
+        "Metode Secant": """
+Metode Secant menggunakan dua pendekatan sebelumnya untuk memperkirakan kemiringan fungsi, sehingga tidak memerlukan turunan analitik.
+
+**xₙ₊₁ = xₙ − f(xₙ)(xₙ−xₙ₋₁)/(f(xₙ)−f(xₙ₋₁))**
+
+Diperlukan dua tebakan awal dan penyebut tidak boleh nol.
+"""
+    }
+    topic = st.selectbox("Pilih topik", list(topics.keys()))
+    topic_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", topics[topic]).replace(chr(10), "<br>")
+    st.markdown(f'<div class="card"><h3>📖 {topic}</h3><p>{topic_html}</p></div>', unsafe_allow_html=True)
+    if topic == "Metode Newton-Raphson (Lengkap)":
+        section("Pembahasan lengkap")
+        render_newton_materi()
+    else:
+        st.caption("Materi ini merupakan ringkasan pengantar. Pembahasan lengkap saat ini tersedia pada topik Metode Newton-Raphson.")
+    log_once("Membuka materi")
+
 # ------------------------- KALKULATOR -------------------------
 if page == "Kalkulator":
     hero("Laboratorium Newton-Raphson", "Masukkan fungsi dan parameter untuk menghampiri akar persamaan.", "xₙ₊₁ = xₙ − f(xₙ) / f′(xₙ)")
@@ -570,7 +818,8 @@ if page == "Kalkulator":
             "x³ − 2x − 5": ("x^3 - 2*x - 5", "3*x^2 - 2", "2.5"),
             "cos(x) − x": ("cos(x) - x", "-sin(x) - 1", "0.5"),
             "x² − 2": ("x^2 - 2", "2*x", "1.5"),
-            "eˣ − 5": ("exp(x) - 5", "exp(x)", "1.5")
+            "eˣ − 5": ("exp(x) - 5", "exp(x)", "1.5"),
+            "x³ − 2x + 2 (kasus siklus, x₀ = 0)": ("x^3 - 2*x + 2", "3*x^2 - 2", "0")
         }
         chosen = st.selectbox("Contoh fungsi", ["Input sendiri"] + list(examples))
         defaults = examples.get(chosen, ("x^3 - 2*x - 5", "3*x^2 - 2", "2.5"))
@@ -652,57 +901,125 @@ if page == "Visualisasi":
         st.success(f"Iterasi {last['n']}: garis singgung di x = {last['x_n']:.8f} menghasilkan pendekatan baru x = {last['x_next']:.8f}.")
 
 # ------------------------- KUIS -------------------------
-if page == "Kuis":
-    hero("Kuis Pemahaman", "Uji pemahaman konsep dasar Newton-Raphson. Pilih jawaban terbaik.")
-    questions = [
-        ("Tujuan utama metode Newton-Raphson adalah ...",
-         ["Menghampiri akar persamaan f(x)=0", "Menghitung luas daerah", "Mencari nilai maksimum matriks", "Mengurutkan data"],
-         0, "Metode Newton-Raphson merupakan metode iteratif untuk mencari akar persamaan nonlinear."),
-        ("Rumus iterasi Newton-Raphson yang benar adalah ...",
-         ["xₙ₊₁ = xₙ + f(xₙ)", "xₙ₊₁ = xₙ − f(xₙ)/f′(xₙ)", "xₙ₊₁ = f′(xₙ)/xₙ", "xₙ₊₁ = xₙ × f(xₙ)"],
-         1, "Pendekatan baru diperoleh dengan mengurangi xₙ menggunakan perbandingan f(xₙ) dan turunannya."),
-        ("Apa yang dapat terjadi jika f′(xₙ) = 0?",
-         ["Iterasi pasti langsung konvergen", "Pembagian tidak dapat dilakukan", "Akar selalu ditemukan", "Galat otomatis menjadi nol"],
-         1, "Turunan menjadi penyebut dalam rumus iterasi sehingga pembagian dengan nol tidak dapat dilakukan."),
-        ("Dalam metode Newton-Raphson, x₀ menyatakan ...",
-         ["Toleransi galat", "Jumlah iterasi", "Tebakan awal", "Nilai turunan"],
-         2, "Proses iterasi dimulai dari suatu nilai pendekatan awal."),
-        ("Jika galat relatif sudah lebih kecil daripada toleransi, maka ...",
-         ["Iterasi dapat dihentikan", "Fungsi harus dihapus", "Tebakan awal harus selalu nol", "Turunan tidak diperlukan lagi"],
-         0, "Toleransi merupakan batas ketelitian yang digunakan sebagai kriteria penghentian.")
-    ]
-    if not st.session_state.quiz_submitted:
-        with st.form("quiz_form"):
-            answers = {}
-            for i, (question, options, correct, explanation) in enumerate(questions):
-                st.markdown(f"**{i+1}. {question}**")
-                answers[i] = st.radio("Pilih jawaban", options, key=f"quiz_{i}", label_visibility="collapsed")
-                st.divider()
-            submit_quiz = st.form_submit_button("Kirim jawaban dan lihat nilai", type="primary", use_container_width=True)
-        if submit_quiz:
-            score = sum(1 for i, q in enumerate(questions) if answers[i] == q[1][q[2]])
-            st.session_state.quiz_score = score
-            st.session_state.quiz_submitted = True
-            st.session_state.quiz_review = [(answers[i], q[1][q[2]], q[3]) for i, q in enumerate(questions)]
-            save_quiz(username, score, len(questions))
-            log_activity(username, "Menyelesaikan kuis Newton-Raphson")
-            st.rerun()
+def build_quiz(level):
+    """Ambil soal acak untuk sebuah level dan acak urutan pilihannya."""
+    if level == "Campuran":
+        picked = []
+        for lv in ("Dasar", "Menengah", "Mahir"):
+            picked += random.sample(QUIZ_BANK[lv], min(5, len(QUIZ_BANK[lv])))
+        random.shuffle(picked)
     else:
-        score = st.session_state.quiz_score
-        st.markdown(f'<div class="card"><div style="font-size:2.5rem">🏆</div><h2>Skor kamu: {score}/5</h2><p>{"Hebat! Pemahamanmu sudah baik." if score >= 4 else "Terus berlatih. Pelajari kembali materi dan coba lagi."}</p></div>', unsafe_allow_html=True)
-        for i, (chosen, correct, explanation) in enumerate(st.session_state.quiz_review):
-            st.markdown(f"**{i+1}. {questions[i][0]}**")
-            if chosen == correct:
-                st.success(f"Jawabanmu: {chosen}")
+        bank = QUIZ_BANK[level]
+        picked = random.sample(bank, min(LEVELS[level]["n"], len(bank)))
+    built = []
+    for question, options, correct_idx, explanation in picked:
+        shuffled = list(options)
+        random.shuffle(shuffled)
+        built.append({"q": question, "options": shuffled, "correct": options[correct_idx], "exp": explanation})
+    return built
+
+def start_quiz(level):
+    st.session_state.quiz_level = level
+    st.session_state.quiz_set = build_quiz(level)
+    st.session_state.quiz_attempt += 1
+    st.session_state.quiz_submitted = False
+
+def leave_quiz():
+    st.session_state.quiz_level = None
+    st.session_state.quiz_set = []
+    st.session_state.quiz_submitted = False
+
+if page == "Kuis":
+    hero("Kuis Bertingkat", "Pilih level, kerjakan soal yang diacak setiap percobaan, lalu lihat nilai dan pembahasannya.")
+    ss = st.session_state
+
+    # ----- 1) Pilih level -----
+    if ss.quiz_level is None:
+        level_stats = get_level_stats(username)
+        total_bank = sum(len(v) for v in QUIZ_BANK.values())
+        st.caption(f"Tersedia {total_bank} soal dalam 3 tingkat. Setiap percobaan mengambil soal acak dengan urutan pilihan yang juga diacak. "
+                   f"Lulus bila skor minimal {PASS_PERCENT}%.")
+        for col, (key, info) in zip(st.columns(len(LEVELS), gap="medium"), LEVELS.items()):
+            attempts, best = level_stats.get(key, (0, None))
+            if attempts:
+                status = f"Terbaik {best}% · {attempts}x percobaan" + (" ✅" if best >= PASS_PERCENT else "")
             else:
-                st.error(f"Jawabanmu: {chosen} · Jawaban benar: {correct}")
-            st.caption(explanation)
-        if st.button("Ulangi kuis", type="primary"):
-            st.session_state.quiz_submitted = False
-            st.session_state.quiz_answers = {}
-            for i in range(len(questions)):
-                st.session_state.pop(f"quiz_{i}", None)
+                status = "Belum dicoba"
+            with col:
+                st.markdown(f'<div class="card"><div style="font-size:1.8rem">{info["icon"]}</div><h3>{info["title"]}</h3>'
+                            f'<p>{info["desc"]}</p><span class="pill">{info["n"]} soal</span> '
+                            f'<span class="pill">{status}</span></div>', unsafe_allow_html=True)
+                if st.button(f"Mulai {key}", key=f"start_{key}", type="primary", use_container_width=True):
+                    start_quiz(key)
+                    st.rerun()
+
+    # ----- 2) Mengerjakan soal -----
+    elif not ss.quiz_submitted:
+        info = LEVELS[ss.quiz_level]
+        qs = ss.quiz_set
+        st.markdown(f'<span class="pill">{info["icon"]} {info["title"]}</span> '
+                    f'<span class="pill">{len(qs)} soal</span> <span class="pill">Lulus ≥ {PASS_PERCENT}%</span>', unsafe_allow_html=True)
+        st.write("")
+        with st.form("quiz_form"):
+            for i, item in enumerate(qs):
+                st.markdown(f"**{i+1}. {item['q']}**")
+                st.radio("Pilih jawaban", item["options"], index=None, key=f"quiz_{ss.quiz_attempt}_{i}", label_visibility="collapsed")
+                st.divider()
+            b1, b2 = st.columns([3, 1])
+            submit_quiz = b1.form_submit_button("Kirim jawaban dan lihat nilai", type="primary", use_container_width=True)
+            cancel_quiz = b2.form_submit_button("Batal", use_container_width=True)
+        if cancel_quiz:
+            leave_quiz()
             st.rerun()
+        if submit_quiz:
+            chosen = [ss.get(f"quiz_{ss.quiz_attempt}_{i}") for i in range(len(qs))]
+            blank = [str(i + 1) for i, c in enumerate(chosen) if c is None]
+            if blank:
+                st.warning(f"Masih ada {len(blank)} soal yang belum dijawab (nomor {', '.join(blank)}). Lengkapi dulu sebelum mengirim.")
+            else:
+                score = sum(1 for item, c in zip(qs, chosen) if c == item["correct"])
+                ss.quiz_score = score
+                ss.quiz_chosen = chosen
+                ss.quiz_submitted = True
+                save_quiz(username, score, len(qs), ss.quiz_level)
+                log_activity(username, f"Menyelesaikan kuis level {ss.quiz_level}")
+                st.rerun()
+
+    # ----- 3) Hasil & pembahasan -----
+    else:
+        info = LEVELS[ss.quiz_level]
+        qs, chosen, score = ss.quiz_set, ss.quiz_chosen, ss.quiz_score
+        total = len(qs)
+        pct = round(score * 100 / total)
+        passed = pct >= PASS_PERCENT
+        if ss.quiz_level == "Dasar":
+            tip = "Lanjutkan ke **Level 2 · Menengah** untuk berlatih menghitung iterasi." if passed else "Pelajari lagi materi Newton-Raphson, lalu ulangi level ini."
+        elif ss.quiz_level == "Menengah":
+            tip = "Lanjutkan ke **Level 3 · Mahir** untuk tantangan analisis." if passed else "Coba kerjakan contoh hitung di menu Materi, lalu ulangi level ini."
+        elif ss.quiz_level == "Mahir":
+            tip = "Luar biasa! Coba **Tantangan Campuran** untuk menguji semuanya." if passed else "Baca kembali tab Konvergensi dan Kasus gagal pada Materi, lalu ulangi."
+        else:
+            tip = "Pemahamanmu sudah merata di semua level." if passed else "Tinjau pembahasan di bawah dan ulangi level yang masih lemah."
+        st.markdown(f'<div class="card"><div style="font-size:2.5rem">{"🏆" if passed else "📘"}</div>'
+                    f'<h2>{info["title"]} · Skor: {score}/{total} ({pct}%)</h2>'
+                    f'<p>{"Lulus! " if passed else "Belum lulus. "}{"Hebat, pemahamanmu sudah baik." if passed else "Terus berlatih, kamu pasti bisa."}</p></div>', unsafe_allow_html=True)
+        st.write("")
+        st.info(tip)
+        r1, r2 = st.columns(2)
+        if r1.button("🔁 Ulangi level ini (soal diacak ulang)", type="primary", use_container_width=True):
+            start_quiz(ss.quiz_level)
+            st.rerun()
+        if r2.button("🧭 Pilih level lain", use_container_width=True):
+            leave_quiz()
+            st.rerun()
+        section("Pembahasan")
+        for i, (item, c) in enumerate(zip(qs, chosen)):
+            st.markdown(f"**{i+1}. {item['q']}**")
+            if c == item["correct"]:
+                st.success(f"Jawabanmu: {c}")
+            else:
+                st.error(f"Jawabanmu: {c} · Jawaban benar: {item['correct']}")
+            st.caption(item["exp"])
 
 # ------------------------- PROFIL -------------------------
 if page == "Profil":
@@ -715,7 +1032,13 @@ if page == "Profil":
     section("Ringkasan aktivitas")
     a, b, c = st.columns(3)
     kpi(a, "🧠", "Kuis dikerjakan", quiz_count, "Total percobaan")
-    kpi(b, "🏆", "Skor terbaik", f"{best_score}/5" if quiz_count else "—", "Skor tertinggi")
+    kpi(b, "🏆", "Skor terbaik", f"{best_pct}%" if quiz_count else "—", "Skor tertinggi (semua level)")
     kpi(c, "📌", "Aktivitas", activity_count, "Aktivitas tercatat")
+    section("Capaian per level kuis")
+    level_stats = get_level_stats(username)
+    for col, (key, info) in zip(st.columns(len(LEVELS)), LEVELS.items()):
+        attempts, best = level_stats.get(key, (0, None))
+        kpi(col, info["icon"], info["title"], f"{best}%" if attempts else "—",
+            f"{attempts}x percobaan" + (" · lulus ✅" if attempts and best >= PASS_PERCENT else ""))
 
 st.markdown('<div class="footer">NUMERIKA · Belajar Metode Numerik dengan lebih interaktif</div>', unsafe_allow_html=True)
